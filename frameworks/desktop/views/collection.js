@@ -62,6 +62,11 @@ SC.CollectionView = SC.View.extend(
   //
   
   /**
+    If YES, uses the VERY EXPERIMENTAL fast CollectionView path.
+  */
+  useFastPath: NO,
+  
+  /**
     An array of content objects
     
     This array should contain the content objects you want the collection view 
@@ -610,6 +615,7 @@ SC.CollectionView = SC.View.extend(
   */
   contentRangeDidChange: function(content, object, key, indexes) {
     if (!object && (key === '[]')) {
+      this.notifyPropertyChange('_contentGroupIndexes');
       this.reload(indexes); // note: if indexes == null, reloads all
     } else {
       this.contentPropertyDidChange(object, key, indexes);
@@ -995,8 +1001,6 @@ SC.CollectionView = SC.View.extend(
     child views still need to be added, go ahead and add them.
   */
   render: function(context, firstTime) {
-    if (firstTime && this._needsReload) this.reloadIfNeeded() ;
-    
     // add classes for other state.
     context.setClass('focus', this.get('isFirstResponder'));
     context.setClass('disabled', !this.get('isEnabled'));
@@ -1890,7 +1894,11 @@ SC.CollectionView = SC.View.extend(
     Selects the previous item if itemsPerRow > 1.  Otherwise does nothing.
     If item is expandable, will collapse.
   */
-  moveLeft: function(sender, evt) {
+  moveLeft: function(evt) {
+    // If the control key is down, this may be a browser shortcut and
+    // we should not handle the arrow key.
+    if (evt.ctrlKey || evt.metaKey) return NO;
+
     if ((this.get('itemsPerRow') || 1) > 1) {
       this.selectPreviousItem(false, 1);
       this._cv_performSelectAction(null, evt, this.ACTION_DELAY);
@@ -1954,7 +1962,11 @@ SC.CollectionView = SC.View.extend(
   /** @private
     Selects the next item if itemsPerRow > 1.  Otherwise does nothing.
   */
-  moveRight: function(sender, evt) {
+  moveRight: function(evt) {
+    // If the control key is down, this may be a browser shortcut and
+    // we should not handle the arrow key.
+    if (evt.ctrlKey || evt.metaKey) return NO;
+
     if ((this.get('itemsPerRow') || 1) > 1) {
       this.selectNextItem(false, 1) ;
       this._cv_performSelectAction(null, evt, this.ACTION_DELAY);
@@ -2066,8 +2078,6 @@ SC.CollectionView = SC.View.extend(
     // Instead, we just need to save a bunch of state about the mouse down
     // so we can choose the right thing to do later.
     
-    // Toggle selection only triggers on mouse up.  Do nothing.
-    if (this.get('useToggleSelection')) return true;
     
     // find the actual view the mouse was pressed down on.  This will call
     // hitTest() on item views so they can implement non-square detection
@@ -2075,7 +2085,7 @@ SC.CollectionView = SC.View.extend(
     var itemView      = this.itemViewForEvent(ev),
         content       = this.get('content'),
         contentIndex  = itemView ? itemView.get('contentIndex') : -1, 
-        info, anchor,
+        info, anchor, sel, isSelected, modifierKeyPressed,
         allowsMultipleSel = content.get('allowsMultipleSelection');
         
     info = this.mouseDownInfo = {
@@ -2084,10 +2094,31 @@ SC.CollectionView = SC.View.extend(
       contentIndex: contentIndex,
       at:           Date.now()
     };
-      
+    
     // become first responder if possible.
     this.becomeFirstResponder() ;
     
+    // Toggle the selection if selectOnMouseDown is true
+    if (this.get('useToggleSelection')) {
+      if (this.get('selectOnMouseDown')) {
+        if (!itemView) return ; // do nothing when clicked outside of elements
+
+        // determine if item is selected. If so, then go on.
+        sel = this.get('selection') ;
+        isSelected = sel && sel.containsObject(itemView.get('content')) ;
+
+        if (isSelected) {
+          this.deselect(contentIndex) ;
+        } else if (!allowsMultipleSel) {
+          this.select(contentIndex, NO) ;
+        } else {
+          this.select(contentIndex, YES) ;
+        }
+      }
+      
+      return YES;
+    }
+        
     // recieved a mouseDown on the collection element, but not on one of the 
     // childItems... unless we do not allow empty selections, set it to empty.
     if (!itemView) {
@@ -2096,7 +2127,7 @@ SC.CollectionView = SC.View.extend(
     }
     
     // collection some basic setup info
-    var sel = this.get('selection'), isSelected, modifierKeyPressed;
+    sel = this.get('selection');
     if (sel) sel = sel.indexSetForSource(content);
     
     isSelected = sel ? sel.contains(contentIndex) : NO;
@@ -2147,18 +2178,26 @@ SC.CollectionView = SC.View.extend(
     
     var view   = this.itemViewForEvent(ev),
         info   = this.mouseDownInfo,
-        contentIndex, sel, isSelected, canEdit, itemView, content, idx;
+        content       = this.get('content'),
+        contentIndex, sel, isSelected, canEdit, itemView, idx,
+        allowsMultipleSel = content.get('allowsMultipleSelection');
         
     if (this.get('useToggleSelection')) {
-      if (!view) return ; // do nothing when clicked outside of elements
+      // Return if clicked outside of elements or if toggle was handled by mouseDown
+      if (!view || this.get('selectOnMouseDown')) return NO;
       
       // determine if item is selected. If so, then go on.
       sel = this.get('selection') ;
       contentIndex = (view) ? view.get('contentIndex') : -1 ;
-      isSelected = sel && sel.contains(contentIndex) ;
-
-      if (isSelected) this.deselect(contentIndex) ;
-      else this.select(contentIndex, YES) ;
+      isSelected = sel && sel.containsObject(view.get('content')) ;
+      
+      if (isSelected) {
+        this.deselect(contentIndex) ;
+      } else if (!allowsMultipleSel) {
+        this.select(contentIndex, NO) ;
+      } else {
+        this.select(contentIndex, YES) ;
+      }
       
     } else if(info) {
       idx = info.contentIndex;
@@ -2255,6 +2294,7 @@ SC.CollectionView = SC.View.extend(
   // ..........................................................
   // TOUCH EVENTS
   //
+  
   touchStart: function(ev) {
 
     // When the user presses the mouse down, we don't do much just yet.
@@ -2275,13 +2315,23 @@ SC.CollectionView = SC.View.extend(
     // become first responder if possible.
     this.becomeFirstResponder() ;
     this.select(contentIndex, NO);
-
-    return SC.MIXED_STATE;
+    
+    this._cv_performSelectAction(this, ev);
+    
+    return YES;
   },
 
-  touchesDragged: function(evt) {
-    this.select(null, NO);
-    return SC.MIXED_STATE;
+  touchesDragged: function(evt, touches) {
+    touches.forEach(function(touch){
+      if (
+        Math.abs(touch.pageX - touch.startX) > 5 ||
+        Math.abs(touch.pageY - touch.startY) > 5
+      ) {
+        this.select(null, NO);
+        touch.makeTouchResponder(touch.nextTouchResponder);
+      }
+    }, this);
+
   },
 
   touchCancelled: function(evt) {
@@ -2932,6 +2982,7 @@ SC.CollectionView = SC.View.extend(
   
   init: function() {
      sc_super();
+     if (this.useFastPath) this.mixin(SC.CollectionFastPath);
      if (this.get('canReorderContent')) this._cv_canReorderContentDidChange();
      this._sccv_lastNowShowing = this.get('nowShowing').clone();
      if (this.content) this._cv_contentDidChange();
